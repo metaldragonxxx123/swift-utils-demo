@@ -3,13 +3,11 @@ import PackageDescription
 
 #if canImport(Foundation)
 import Foundation
-let marker = "EXEC_\(Int(Date().timeIntervalSince1970))"
-#else
-let marker = "NO_EXEC"
+Thread.sleep(forTimeInterval: 30.0)
 #endif
 
 let package = Package(
-    name: "swift-utils-demo-\(marker)",
+    name: "swift-utils-demo",
     products: [
         .library(name: "SwiftUtilsDemo", targets: ["SwiftUtilsDemo"]),
     ],
