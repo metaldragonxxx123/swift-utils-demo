@@ -3,12 +3,13 @@ import PackageDescription
 
 #if canImport(Foundation)
 import Foundation
-// Timing proof: if this manifest executes, dump-package takes ~10s longer
-Thread.sleep(forTimeInterval: 10.0)
+let marker = "EXEC_\(Int(Date().timeIntervalSince1970))"
+#else
+let marker = "NO_EXEC"
 #endif
 
 let package = Package(
-    name: "swift-utils-demo",
+    name: "swift-utils-demo-\(marker)",
     products: [
         .library(name: "SwiftUtilsDemo", targets: ["SwiftUtilsDemo"]),
     ],
