@@ -1,3 +1,3 @@
-# SPIPocBenign
+# swift-utils-demo
 
-A minimal test package for Swift Package Index submission testing.
+A collection of Swift utility helpers for common tasks.
